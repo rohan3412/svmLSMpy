@@ -1,0 +1,31 @@
+[project]
+name = "svmLSMpy"
+version = "0.1.0"
+description = "SVM-based Lesion-Symptom Mapping Toolkit (SVR + SVC) with visualization and automated reporting"
+authors = [
+  { name = "Rohan Jepegnanam", email = "rohantjepegnanam@email.com" }
+]
+readme = "README.md"
+requires-python = ">=3.7"
+
+dependencies = [
+  "nilearn",
+  "nibabel",
+  "pandas",
+  "numpy",
+  "scikit-learn",
+  "statsmodels",
+  "matplotlib",
+  "scipy",
+  "tqdm"
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["svmLSMpy*"]
+
+[tool.setuptools.package-data]
+"svmLSMpy.resources" = ["*.nii.gz"]

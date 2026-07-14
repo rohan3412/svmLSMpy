@@ -1,0 +1,19 @@
+# graphify knowledge-graph output (not part of the package)
+graphify-out/
+
+# local instructions, not part of the package
+CLAUDE.md
+
+# generated test fixtures and outputs
+tests/fixtures/data/
+test-package-output/
+*_results_*/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/

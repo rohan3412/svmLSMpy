@@ -1,0 +1,1 @@
+{'C': np.int64(1), 'Gamma': 'scale', 'Epsilon': np.float64(0.1)}
