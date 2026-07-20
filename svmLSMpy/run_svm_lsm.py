@@ -78,7 +78,8 @@ def run_svm_lsm(symptom_folder,
                 n_permutations=1000,
                 alpha=0.05,
                 n_splits=5,
-                num_slices=7):
+                num_slices=7,
+                search="grid"):
     """
     Unified SVM-LSM entry point. Auto-detects SVR (continuous behaviour) vs SVC
     (categorical behaviour, binary or one-vs-rest multiclass) from the 'behavior'
@@ -86,6 +87,9 @@ def run_svm_lsm(symptom_folder,
 
     max_score is required only for SVR (the behaviour is divided by it); it is ignored
     for SVC.
+
+    search selects hyper-parameter tuning: "grid" (exhaustive, default) or "nelder_mead"
+    (coarse grid then a derivative-free simplex refinement of C/gamma, plus epsilon for SVR).
     """
     task = _resolve_task(mode, csv_path)
 
@@ -107,7 +111,8 @@ def run_svm_lsm(symptom_folder,
                           n_permutations=n_permutations,
                           alpha=alpha,
                           n_splits=n_splits,
-                          num_slices=num_slices)
+                          num_slices=num_slices,
+                          search=search)
 
 
 def _run_with_task(symptom_folder,
@@ -125,7 +130,8 @@ def _run_with_task(symptom_folder,
                    n_permutations=1000,
                    alpha=0.05,
                    n_splits=5,
-                   num_slices=7):
+                   num_slices=7,
+                   search="grid"):
     """
     Shared SVM-LSM orchestrator for both SVR and SVC. Loads lesions + behaviour,
     filters voxels, regresses covariates, runs the generic svm_lsm core (which returns
@@ -197,7 +203,8 @@ def _run_with_task(symptom_folder,
                       task=task,
                       n_permutations=n_permutations,
                       alpha=alpha,
-                      n_splits=n_splits)
+                      n_splits=n_splits,
+                      search=search)
 
     # Dataset statistics
     num_lesions = len(lesion_files)
@@ -214,10 +221,11 @@ def _run_with_task(symptom_folder,
     # Report tail: one report per decision map. suffix keeps one-vs-rest maps distinct.
     for r in results:
         label_suffix = f" ({r.label})" if r.label else ""
+        signal_suffix = " - NO SIGNAL (all-zero z-map)" if r.no_signal else ""
         report_path = output_folder / f"{task.kind}_lsm_report{r.suffix}.html"
         save_report(report_path,
                     r.best_params,
-                    behaviour_name + label_suffix,
+                    behaviour_name + label_suffix + signal_suffix,
                     n_permutations,
                     alpha,
                     r.zmap,

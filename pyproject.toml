@@ -16,6 +16,7 @@ dependencies = [
   "scikit-learn",
   "statsmodels",
   "matplotlib",
+  "plotly",
   "scipy",
   "tqdm"
 ]

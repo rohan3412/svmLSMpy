@@ -11,6 +11,7 @@ import nibabel as nib
 from nilearn.image import threshold_img
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+from scipy.optimize import minimize
 from sklearn.utils import shuffle
 from tqdm import tqdm
 
@@ -18,6 +19,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from .util import easy_time, easy_eta
+from .plot_tuning import plot_tuning
 
 
 @dataclass
@@ -30,11 +32,45 @@ class MapResult:
     coef_map: np.ndarray
     nifti_zmap: object    # nibabel image
     zmap: np.ndarray
+    no_signal: bool = False  # True when the map degenerated to an all-zero z-map (no signal)
+
+
+def _cv_score(features, behaviors, task, params, n_splits, verbose=False):
+    """Evaluate one hyper-parameter point by K-fold CV using the task's scorer.
+    Returns (avg_score, per_fold_scores, per_fold_support_vector_counts)."""
+    scores = []
+    no_of_sv = []
+
+    cv = task.make_cv(n_splits)
+    splits = cv.split(features, behaviors) if task.stratified else cv.split(features)
+
+    for fold_idx, (train_idx, test_idx) in enumerate(splits, 1):
+        if verbose:
+            print(f"Split :{fold_idx}/{n_splits}")
+        X_train, X_test = features[train_idx], features[test_idx]
+        y_train, y_test = behaviors[train_idx], behaviors[test_idx]
+
+        est = task.make_estimator(params)
+        est.fit(X_train, y_train)
+
+        if verbose:
+            print(f"\tno. of support vectors : {len(est.support_)}/{len(features)}", )
+        no_of_sv.append(len(est.support_))
+
+        y_pred = est.decision_function(X_test) if task.score_uses_decision else est.predict(X_test)
+        score = task.scorer(y_test, y_pred)
+
+        if verbose:
+            print(f"\tscore : {score}", )
+        scores.append(score)
+
+    return float(np.mean(scores)), scores, no_of_sv
 
 
 def _grid_search(features, behaviors, output_folder, param_grid, task, n_splits, suffix=""):
     """Grid-search hyper-parameters by K-fold CV using the task's scorer. Writes
-    results_and_scores{suffix}.csv and returns the best parameter dict."""
+    results_and_scores{suffix}.csv and returns (best_params, evaluations) - the latter a
+    list of {**params, 'avg_score', 'source': 'grid'} dicts for the tuning plot."""
     print(f"Running {task.name} analysis...")
 
     # Perform grid search with K-fold cross-validation
@@ -47,9 +83,8 @@ def _grid_search(features, behaviors, output_folder, param_grid, task, n_splits,
     best_score = task.worst_score()
     best_iteration = 1
 
-    patient_count = len(features)
     all_scores = []
-    i = 1
+    evaluations = []
     num_iter = len(param_combinations)
 
     for idx, combo in enumerate(param_combinations, 1):
@@ -57,45 +92,21 @@ def _grid_search(features, behaviors, output_folder, param_grid, task, n_splits,
         print(f"\nIteration: {idx}/{num_iter}, Testing parameters: {params}")
         iter_time = time.time()
 
-        scores = []
-        no_of_sv = []
-
-        cv = task.make_cv(n_splits)
-        splits = cv.split(features, behaviors) if task.stratified else cv.split(features)
-
-        for fold_idx, (train_idx, test_idx) in enumerate(splits, 1):
-            print(f"Split :{fold_idx}/{n_splits}")
-            X_train, X_test = features[train_idx], features[test_idx]
-            y_train, y_test = behaviors[train_idx], behaviors[test_idx]
-
-            est = task.make_estimator(params)
-            est.fit(X_train, y_train)
-
-            print(f"\tno. of support vectors : {len(est.support_)}/{patient_count}", )
-            no_of_sv.append(len(est.support_))
-
-            y_pred = est.decision_function(X_test) if task.score_uses_decision else est.predict(X_test)
-            score = task.scorer(y_test, y_pred)
-
-            print(f"\tscore : {score}", )
-            scores.append(score)
-
-        # Average score across all folds
-        avg_score = np.mean(scores)
+        avg_score, scores, no_of_sv = _cv_score(features, behaviors, task, params, n_splits, verbose=True)
         avg_no_of_sv = np.mean(no_of_sv)
 
-        all_scores.append((i, *combo, avg_score, scores, avg_no_of_sv, no_of_sv))
+        all_scores.append((idx, *combo, avg_score, scores, avg_no_of_sv, no_of_sv))
+        evaluations.append({**params, "avg_score": avg_score, "source": "grid"})
 
         print(f"\nAverage score: {avg_score:.4f}")
         print(scores, "\n")
 
         # Update best parameters if current score is better
         if task.is_better(avg_score, best_score):
-            best_iteration = i
+            best_iteration = idx
             best_score = avg_score
             best_params = params
 
-        i = i + 1
         print(f"Best iteration: {best_iteration}, Best score: {best_score:.4f}, Current Score: {avg_score:.4f}")
         print(f"Iteration {best_iteration} parameters: {best_params}")
 
@@ -113,6 +124,79 @@ def _grid_search(features, behaviors, output_folder, param_grid, task, n_splits,
     print(f"Results and scores saved to {output_path}")
 
     print(f"\nBest parameters found: {best_params} with score {best_score:.4f} in iteration {best_iteration}/{num_iter}")
+    return best_params, evaluations
+
+
+def _resolve_numeric_gamma(gamma, features):
+    """Map sklearn's string gammas to their numeric value so they can seed the simplex."""
+    if gamma == "scale":
+        return 1.0 / (features.shape[1] * features.var())
+    if gamma == "auto":
+        return 1.0 / features.shape[1]
+    return float(gamma)
+
+
+def _nelder_mead_refine(features, behaviors, task, best_params, grid_best_score,
+                        n_splits, evaluations):
+    """Locally refine the best grid point with a derivative-free Nelder-Mead simplex -
+    the sound (gradient-free) stand-in for the BFGS the objective can't support.
+
+    Optimizes [log10(C), log10(gamma)] for SVC and [log10(C), log10(gamma), epsilon] for
+    SVR. Every evaluated point is appended to `evaluations` (source='refine') for the plot.
+    Returns the better of the grid best and the simplex best (guarded against CV noise)."""
+    refine_epsilon = "epsilon" in task.param_names
+    sign = -1.0 if task.greater_is_better else 1.0
+    LOG_LO, LOG_HI, EPS_MIN, PENALTY = -4.0, 3.0, 1e-3, 1e6
+
+    x0 = [np.log10(float(best_params["C"])),
+          np.log10(_resolve_numeric_gamma(best_params["gamma"], features))]
+    if refine_epsilon:
+        x0.append(float(best_params.get("epsilon", 0.1)))
+
+    def objective(x):
+        logC, logG = x[0], x[1]
+        if not (LOG_LO <= logC <= LOG_HI and LOG_LO <= logG <= LOG_HI):
+            return PENALTY
+        params = {"C": float(10 ** logC), "gamma": float(10 ** logG)}
+        if refine_epsilon:
+            if x[2] < EPS_MIN:
+                return PENALTY
+            params["epsilon"] = float(x[2])
+        avg_score, _, _ = _cv_score(features, behaviors, task, params, n_splits)
+        evaluations.append({**params, "avg_score": avg_score, "source": "refine"})
+        return sign * avg_score
+
+    print("\nRefining best parameters with Nelder-Mead simplex...")
+    res = minimize(objective, x0, method="Nelder-Mead",
+                   options={"maxiter": 60, "xatol": 1e-2, "fatol": 1e-4})
+
+    nm_params = {"C": float(10 ** res.x[0]), "gamma": float(10 ** res.x[1])}
+    if refine_epsilon:
+        nm_params["epsilon"] = float(max(res.x[2], EPS_MIN))
+    nm_score = sign * res.fun
+
+    if task.is_better(nm_score, grid_best_score):
+        print(f"Nelder-Mead improved: {nm_params} score {nm_score:.4f} (grid best {grid_best_score:.4f})")
+        return nm_params
+    print(f"Nelder-Mead did not beat grid best ({grid_best_score:.4f}); keeping grid params.")
+    return best_params
+
+
+def _search(features, behaviors, output_folder, param_grid, task, n_splits, search, suffix=""):
+    """Run the coarse grid, optionally refine with Nelder-Mead, plot the tuning surface,
+    and return the chosen best_params."""
+    best_params, evaluations = _grid_search(
+        features, behaviors, output_folder, param_grid, task, n_splits, suffix=suffix)
+
+    if search == "nelder_mead":
+        grid_scores = [e["avg_score"] for e in evaluations]
+        grid_best_score = max(grid_scores) if task.greater_is_better else min(grid_scores)
+        best_params = _nelder_mead_refine(
+            features, behaviors, task, best_params, grid_best_score, n_splits, evaluations)
+    elif search != "grid":
+        raise ValueError(f"search must be 'grid' or 'nelder_mead', got {search!r}")
+
+    plot_tuning(evaluations, task, output_folder, suffix=suffix)
     return best_params
 
 
@@ -145,6 +229,26 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
     nifti_coef_map = masking.unmask(coef_map, masker)
     nifti_coef_path = output_folder / f'beta_map{suffix}.nii.gz'
     nib.save(nifti_coef_map, nifti_coef_path)
+
+    # No-signal guard: when every training sample is a support vector, the support-vector
+    # centroid map is label-independent, so every permutation reproduces it and the z-map
+    # would be all zeros. Detect this in ~1s here instead of after the full permutation loop,
+    # then skip permutation testing + the z-distribution histogram and emit zero-filled z-map
+    # artifacts so the report still renders (finish fast, no crash).
+    n_sv = len(est_best.support_)
+    if n_sv == len(features):
+        print(f"\n[no signal] All {n_sv}/{len(features)} samples are support vectors -> the "
+              f"support-vector centroid map is label-independent and the z-map is all zeros. "
+              f"Skipping permutation testing and the z-distribution histogram.")
+        zmap = np.zeros_like(coef_map)
+        nifti_zmap = masking.unmask(zmap, masker)
+        nib.save(nifti_zmap, output_folder / f'zmap{suffix}.nii.gz')
+        zmap_threshold_output_folder = output_folder / f"thresholded_zmaps{suffix}"
+        Path(zmap_threshold_output_folder).mkdir(parents=True, exist_ok=True)
+        for thresh_label in ('p05', 'p01', 'p005', 'p001'):
+            nib.save(nifti_zmap, zmap_threshold_output_folder / f'zmap_{thresh_label}.nii.gz')
+        return MapResult(label=label, suffix=suffix, best_params=best_params,
+                         coef_map=coef_map, nifti_zmap=nifti_zmap, zmap=zmap, no_signal=True)
 
     # Permutation testing
     print("\nPerforming permutation testing...")
@@ -184,7 +288,7 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
                 del vector_mean
 
                 elapsed_time = time.time() - permute_time
-                pbar.set_postfix(elapsed=f"{easy_time(elapsed_time)}", eta=f"{easy_eta((elapsed_time / (i + 1)) * (n_permutations - i - 1))}")
+                pbar.set_postfix(refresh=False, elapsed=f"{easy_time(elapsed_time)}", eta=f"{easy_eta((elapsed_time / (i + 1)) * (n_permutations - i - 1))}")
 
     print(f"Permutations completed. Null distribution saved to {results_file}\n")
 
@@ -205,6 +309,8 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
     zmap_flat = zmap[zmap != 0]
 
     plt.hist(zmap_flat, bins=50, density=True, alpha=0.6, color='blue', label='Z-map distribution')
+
+
 
     # Fit a normal distribution (optional)
     mean, std = np.mean(zmap_flat), np.std(zmap_flat)
@@ -253,20 +359,22 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
 
 
 def _fit_support_vector_map(features, behaviors, masker, output_folder, param_grid,
-                            task, n_permutations, alpha, n_splits, label="", suffix=""):
-    """Single decision map (SVR / binary SVC): grid-search then build one z-map."""
-    best_params = _grid_search(features, behaviors, output_folder, param_grid, task, n_splits, suffix=suffix)
+                            task, n_permutations, alpha, n_splits, search="grid",
+                            label="", suffix=""):
+    """Single decision map (SVR / binary SVC): search hyper-params then build one z-map."""
+    best_params = _search(features, behaviors, output_folder, param_grid, task, n_splits,
+                          search, suffix=suffix)
     return _build_map(features, behaviors, masker, output_folder, task, best_params,
                       n_permutations, label=label, suffix=suffix)
 
 
 def _fit_ovr_maps(features, behaviors, masker, output_folder, param_grid,
-                  task, n_permutations, alpha, n_splits):
+                  task, n_permutations, alpha, n_splits, search="grid"):
     """Option A multiclass one-vs-rest: a SINGLE grid search on the full multiclass
     problem (task.scorer, e.g. balanced accuracy) selects shared hyper-parameters, then
     one binary this-class-vs-rest map is built per class at those hyper-parameters -
     yielding K z-maps. Permutation testing (the expensive step) runs once per class."""
-    best_params = _grid_search(features, behaviors, output_folder, param_grid, task, n_splits)
+    best_params = _search(features, behaviors, output_folder, param_grid, task, n_splits, search)
 
     classes = np.unique(behaviors)
     print(f"\nOne-vs-rest: building {len(classes)} class maps at shared params {best_params}")
@@ -285,21 +393,24 @@ def _fit_ovr_maps(features, behaviors, masker, output_folder, param_grid,
 
 
 def svm_lsm(features, behaviors, masker, output_folder, param_grid, task,
-            n_permutations=1, alpha=0.05, n_splits=5):
+            n_permutations=1, alpha=0.05, n_splits=5, search="grid"):
     """
     Generic SVM-based lesion-symptom mapping. Always returns a list of MapResult -
     length 1 for the single-map strategy (SVR and binary SVC), one per class for the
     one-vs-rest multiclass strategy.
+
+    search: "grid" (exhaustive, default) or "nelder_mead" (coarse grid then a
+    derivative-free simplex refinement of C/gamma, plus epsilon for SVR).
     """
     if task.map_strategy == "single":
         result = _fit_support_vector_map(
             features, behaviors, masker, output_folder, param_grid,
-            task, n_permutations, alpha, n_splits,
+            task, n_permutations, alpha, n_splits, search=search,
         )
         return [result]
     if task.map_strategy == "ovr":
         return _fit_ovr_maps(
             features, behaviors, masker, output_folder, param_grid,
-            task, n_permutations, alpha, n_splits,
+            task, n_permutations, alpha, n_splits, search=search,
         )
     raise NotImplementedError(f"map_strategy '{task.map_strategy}' not implemented yet")
