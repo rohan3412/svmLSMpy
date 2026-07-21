@@ -45,8 +45,11 @@ class LSMTask:
         return candidate > incumbent if self.greater_is_better else candidate < incumbent
 
 
-_C_GRID = [50, 40, 30, 20, 10, 5, 1]
-_GAMMA_GRID = [50, 10, 5, 4, 3, 2, 1, "scale", "auto"]
+# Log-spaced defaults. C spans strong->weak regularization; gamma stays small (large gamma
+# forces every sample to become a support vector -> overfit/degenerate map) and brackets
+# sklearn's data-dependent "scale"/"auto". Nelder-Mead (search="nelder_mead") refines from here.
+_C_GRID = [0.001, 0.01, 0.1, 1, 10, 100, 1000]
+_GAMMA_GRID = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1, "scale", "auto"]
 
 # --- SVR: the original pipeline, now expressed as a task ---------------------
 SVR_TASK = LSMTask(

@@ -54,7 +54,7 @@ def _cv_score(features, behaviors, task, params, n_splits, verbose=False):
         est.fit(X_train, y_train)
 
         if verbose:
-            print(f"\tno. of support vectors : {len(est.support_)}/{len(features)}", )
+            print(f"\tno. of support vectors : {len(est.support_)}/{len(X_train)}", )
         no_of_sv.append(len(est.support_))
 
         y_pred = est.decision_function(X_test) if task.score_uses_decision else est.predict(X_test)
@@ -196,8 +196,22 @@ def _search(features, behaviors, output_folder, param_grid, task, n_splits, sear
     elif search != "grid":
         raise ValueError(f"search must be 'grid' or 'nelder_mead', got {search!r}")
 
+    # Resolve sklearn's string gammas ("scale"/"auto") to their numeric value so they can be
+    # placed on the tuning plot's log-gamma axis (and flagged as special) instead of dropped.
+    for e in evaluations:
+        e["gamma_numeric"] = _resolve_numeric_gamma(e["gamma"], features)
+        e["gamma_special"] = isinstance(e["gamma"], str)
+
     plot_tuning(evaluations, task, output_folder, suffix=suffix)
     return best_params
+
+
+def _weight_map(est):
+    """SVM weight map in input (voxel) space: sum_i (alpha_i * y_i) * support_vector_i, i.e.
+    dual_coef_ @ support_vectors_. This is the label-aware map that equals `coef_` for a linear
+    kernel and, unlike support_vectors_.mean(), stays non-degenerate when every sample is a
+    support vector (strong regularization). Valid for RBF SVR and binary SVC."""
+    return (est.dual_coef_ @ est.support_vectors_).ravel()
 
 
 def _build_map(features, behaviors, masker, output_folder, task, best_params,
@@ -210,7 +224,13 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
     # Train estimator with the best parameters
     est_best = task.make_estimator(best_params)
     est_best.fit(features, behaviors)
-    coef_map = est_best.support_vectors_.mean(axis=0)
+    coef_map = _weight_map(est_best)
+
+    n_sv = len(est_best.support_)
+    if n_sv == len(features):
+        print(f"\nNote: all {n_sv}/{len(features)} samples are support vectors - expected under "
+              f"strong regularization (small C); the model's validity rests on the CV score, not "
+              f"the SV count. The dual-coef weight map stays label-dependent, so the map is valid.")
 
     # save model for later predictions
     model_path = output_folder / f'{task.kind}_model{suffix}.pkl'
@@ -229,26 +249,6 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
     nifti_coef_map = masking.unmask(coef_map, masker)
     nifti_coef_path = output_folder / f'beta_map{suffix}.nii.gz'
     nib.save(nifti_coef_map, nifti_coef_path)
-
-    # No-signal guard: when every training sample is a support vector, the support-vector
-    # centroid map is label-independent, so every permutation reproduces it and the z-map
-    # would be all zeros. Detect this in ~1s here instead of after the full permutation loop,
-    # then skip permutation testing + the z-distribution histogram and emit zero-filled z-map
-    # artifacts so the report still renders (finish fast, no crash).
-    n_sv = len(est_best.support_)
-    if n_sv == len(features):
-        print(f"\n[no signal] All {n_sv}/{len(features)} samples are support vectors -> the "
-              f"support-vector centroid map is label-independent and the z-map is all zeros. "
-              f"Skipping permutation testing and the z-distribution histogram.")
-        zmap = np.zeros_like(coef_map)
-        nifti_zmap = masking.unmask(zmap, masker)
-        nib.save(nifti_zmap, output_folder / f'zmap{suffix}.nii.gz')
-        zmap_threshold_output_folder = output_folder / f"thresholded_zmaps{suffix}"
-        Path(zmap_threshold_output_folder).mkdir(parents=True, exist_ok=True)
-        for thresh_label in ('p05', 'p01', 'p005', 'p001'):
-            nib.save(nifti_zmap, zmap_threshold_output_folder / f'zmap_{thresh_label}.nii.gz')
-        return MapResult(label=label, suffix=suffix, best_params=best_params,
-                         coef_map=coef_map, nifti_zmap=nifti_zmap, zmap=zmap, no_signal=True)
 
     # Permutation testing
     print("\nPerforming permutation testing...")
@@ -273,7 +273,7 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
 
                 est_permutation.fit(features, perm_behaviors)
 
-                vector_mean = est_permutation.support_vectors_.mean(axis=0)
+                vector_mean = _weight_map(est_permutation)
 
                 pickle.dump(vector_mean, f)
 
@@ -305,32 +305,35 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
     # Compute z-map
     zmap = (coef_map - mean_null) / std_null
 
-    # Plot the Histogram
+    # Plot the Histogram. Safety net: if the z-map is entirely zero (a pathological all-null map),
+    # skip the histogram rather than crash on min([]) - the z-map + report are still written.
     zmap_flat = zmap[zmap != 0]
+    no_signal = zmap_flat.size == 0
 
-    plt.hist(zmap_flat, bins=50, density=True, alpha=0.6, color='blue', label='Z-map distribution')
+    if no_signal:
+        print("Warning: z-map has no non-zero values - skipping the z-distribution histogram.")
+    else:
+        plt.hist(zmap_flat, bins=50, density=True, alpha=0.6, color='blue', label='Z-map distribution')
 
+        # Fit a normal distribution (optional)
+        mean, std = np.mean(zmap_flat), np.std(zmap_flat)
+        x = np.linspace(min(zmap_flat), max(zmap_flat), 100)
+        pdf = norm.pdf(x, mean, std)
 
+        # Overlay the normal distribution
+        plt.plot(x, pdf, 'r-', label=f'Normal dist (mu={mean:.2f}, sigma={std:.2f})')
 
-    # Fit a normal distribution (optional)
-    mean, std = np.mean(zmap_flat), np.std(zmap_flat)
-    x = np.linspace(min(zmap_flat), max(zmap_flat), 100)
-    pdf = norm.pdf(x, mean, std)
+        # Set x-axis to be symmetric around 0
+        plt.xlim(left=-max(abs(min(zmap_flat)), abs(max(zmap_flat))), right=max(abs(min(zmap_flat)), abs(max(zmap_flat))))
 
-    # Overlay the normal distribution
-    plt.plot(x, pdf, 'r-', label=f'Normal dist (mu={mean:.2f}, sigma={std:.2f})')
+        # Add labels and legend
+        plt.title('Z-Map Distribution')
+        plt.xlabel('Z-score')
+        plt.ylabel('Density')
+        plt.legend()
 
-    # Set x-axis to be symmetric around 0
-    plt.xlim(left=-max(abs(min(zmap_flat)), abs(max(zmap_flat))), right=max(abs(min(zmap_flat)), abs(max(zmap_flat))))
-
-    # Add labels and legend
-    plt.title('Z-Map Distribution')
-    plt.xlabel('Z-score')
-    plt.ylabel('Density')
-    plt.legend()
-
-    plt.savefig(output_folder / f'z_value_distribution{suffix}.png')
-    plt.close()
+        plt.savefig(output_folder / f'z_value_distribution{suffix}.png')
+        plt.close()
     del zmap_flat
 
     zmap_threshold_output_folder = output_folder / f"thresholded_zmaps{suffix}"
@@ -355,7 +358,7 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
         nib.save(nifti_zmap_thresh, zmap_threshold_output_folder / f'zmap_{thresh_label}.nii.gz')
 
     return MapResult(label=label, suffix=suffix, best_params=best_params,
-                     coef_map=coef_map, nifti_zmap=nifti_zmap, zmap=zmap)
+                     coef_map=coef_map, nifti_zmap=nifti_zmap, zmap=zmap, no_signal=no_signal)
 
 
 def _fit_support_vector_map(features, behaviors, masker, output_folder, param_grid,

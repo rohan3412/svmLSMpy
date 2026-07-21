@@ -148,6 +148,21 @@ def load_lesions_and_behaviors(
         f"max={np.nanmax(lesion_volumes):.3f}, NaNs={np.isnan(lesion_volumes).sum()}"
     )
 
+    # Empty-input guard: fail fast if the maps carry no data. An SVM trained on all-zero
+    # features only ever returns chance scores, all-support-vector degeneracy and empty
+    # beta/z-maps - so catch it here (in seconds) rather than after grid search + permutations.
+    n_empty = int(np.sum(lesion_volumes == 0))
+    if n_empty == len(lesion_files):
+        raise ValueError(
+            f"All {len(lesion_files)} input maps in '{lesion_folder}' are empty (every voxel is "
+            f"zero) - there is nothing to analyze. Check your lesion/disconnectome files; a "
+            f"failed export commonly writes ~all-zero volumes (an empty 181x217x181 map gzips "
+            f"to only ~27 KB)."
+        )
+    if n_empty:
+        print(f"WARNING: {n_empty}/{len(lesion_files)} input maps are empty (all-zero) and "
+              f"contribute no features.")
+
     # Process covariates and lesion volumes only if do_regress_out_covariates is True
     covariate_names = None
     if do_regress_out_covariates:
