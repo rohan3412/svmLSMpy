@@ -14,6 +14,7 @@ from scipy.stats import norm
 from scipy.optimize import minimize
 from sklearn.utils import shuffle
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -37,9 +38,12 @@ class MapResult:
 
 def _cv_score(features, behaviors, task, params, n_splits, verbose=False):
     """Evaluate one hyper-parameter point by K-fold CV using the task's scorer.
-    Returns (avg_score, per_fold_scores, per_fold_support_vector_counts)."""
+    Returns (avg_score, per_fold_scores, per_fold_support_vector_counts, avg_sv_fraction).
+    avg_sv_fraction is the mean over folds of len(support_)/len(training set) - a diagnostic
+    only (1.0 = every training sample is a support vector); it is NOT a selection criterion."""
     scores = []
     no_of_sv = []
+    sv_fracs = []
 
     cv = task.make_cv(n_splits)
     splits = cv.split(features, behaviors) if task.stratified else cv.split(features)
@@ -56,6 +60,7 @@ def _cv_score(features, behaviors, task, params, n_splits, verbose=False):
         if verbose:
             print(f"\tno. of support vectors : {len(est.support_)}/{len(X_train)}", )
         no_of_sv.append(len(est.support_))
+        sv_fracs.append(len(est.support_) / len(X_train))
 
         y_pred = est.decision_function(X_test) if task.score_uses_decision else est.predict(X_test)
         score = task.scorer(y_test, y_pred)
@@ -64,10 +69,19 @@ def _cv_score(features, behaviors, task, params, n_splits, verbose=False):
             print(f"\tscore : {score}", )
         scores.append(score)
 
-    return float(np.mean(scores)), scores, no_of_sv
+    return float(np.mean(scores)), scores, no_of_sv, float(np.mean(sv_fracs))
 
 
-def _grid_search(features, behaviors, output_folder, param_grid, task, n_splits, suffix=""):
+def _eval_one_combo(combo, param_names, features, behaviors, task, n_splits):
+    """Evaluate one hyperparameter combination. Returns all info needed for logging."""
+    params = dict(zip(param_names, combo))
+    avg_score, scores, no_of_sv, avg_sv_frac = _cv_score(
+        features, behaviors, task, params, n_splits)
+    avg_no_of_sv = float(np.mean(no_of_sv))
+    return params, combo, avg_score, scores, no_of_sv, avg_no_of_sv, avg_sv_frac
+
+
+def _grid_search(features, behaviors, output_folder, param_grid, task, n_splits, suffix="", n_jobs=1):
     """Grid-search hyper-parameters by K-fold CV using the task's scorer. Writes
     results_and_scores{suffix}.csv and returns (best_params, evaluations) - the latter a
     list of {**params, 'avg_score', 'source': 'grid'} dicts for the tuning plot."""
@@ -82,38 +96,38 @@ def _grid_search(features, behaviors, output_folder, param_grid, task, n_splits,
     best_params = dict(zip(param_names, param_combinations[0]))
     best_score = task.worst_score()
     best_iteration = 1
+    best_sv_frac = 1.0
 
     all_scores = []
     evaluations = []
     num_iter = len(param_combinations)
 
-    for idx, combo in enumerate(param_combinations, 1):
-        params = dict(zip(param_names, combo))
-        print(f"\nIteration: {idx}/{num_iter}, Testing parameters: {params}")
-        iter_time = time.time()
+    import os
+    actual_jobs = os.cpu_count() if n_jobs == -1 else n_jobs
+    print(f"Evaluating {num_iter} parameter combinations with {actual_jobs} jobs...")
+    grid_time = time.time()
 
-        avg_score, scores, no_of_sv = _cv_score(features, behaviors, task, params, n_splits, verbose=True)
-        avg_no_of_sv = np.mean(no_of_sv)
+    raw_results = Parallel(n_jobs=n_jobs, backend="threading")(
+        delayed(_eval_one_combo)(combo, param_names, features, behaviors, task, n_splits)
+        for combo in tqdm(param_combinations, desc="Queuing grid search")
+    )
 
-        all_scores.append((idx, *combo, avg_score, scores, avg_no_of_sv, no_of_sv))
+    # Process results sequentially to find best params
+    for idx, (params, combo, avg_score, scores, no_of_sv, avg_no_of_sv, avg_sv_frac) in enumerate(raw_results, 1):
+        all_scores.append((idx, *combo, avg_score, scores, avg_no_of_sv, no_of_sv, round(avg_sv_frac, 4)))
         evaluations.append({**params, "avg_score": avg_score, "source": "grid"})
 
-        print(f"\nAverage score: {avg_score:.4f}")
-        print(scores, "\n")
-
-        # Update best parameters if current score is better
         if task.is_better(avg_score, best_score):
             best_iteration = idx
             best_score = avg_score
             best_params = params
+            best_sv_frac = avg_sv_frac
 
-        print(f"Best iteration: {best_iteration}, Best score: {best_score:.4f}, Current Score: {avg_score:.4f}")
-        print(f"Iteration {best_iteration} parameters: {best_params}")
-
-        print(f"Iteration time: {easy_time(int(time.time() - iter_time))}")
+    elapsed = time.time() - grid_time
+    print(f"\nGrid search completed in {easy_time(int(elapsed))}.")
 
     columns = ["Iteration"] + [n.capitalize() for n in param_names] + [
-        "Avg_Score", "Scores", "Avg_Support_Vectors", "Support_Vectors"
+        "Avg_Score", "Scores", "Avg_Support_Vectors", "Support_Vectors", "SV_Fraction"
     ]
 
     df = pd.DataFrame(all_scores, columns=columns)
@@ -124,6 +138,8 @@ def _grid_search(features, behaviors, output_folder, param_grid, task, n_splits,
     print(f"Results and scores saved to {output_path}")
 
     print(f"\nBest parameters found: {best_params} with score {best_score:.4f} in iteration {best_iteration}/{num_iter}")
+    print(f"Selected model's mean SV fraction: {best_sv_frac:.0%} of the training set "
+          f"(diagnostic only; selection is by CV score. {'100% is expected under strong regularization / small C.' if best_sv_frac >= 0.999 else ''})")
     return best_params, evaluations
 
 
@@ -162,7 +178,7 @@ def _nelder_mead_refine(features, behaviors, task, best_params, grid_best_score,
             if x[2] < EPS_MIN:
                 return PENALTY
             params["epsilon"] = float(x[2])
-        avg_score, _, _ = _cv_score(features, behaviors, task, params, n_splits)
+        avg_score, _, _, _ = _cv_score(features, behaviors, task, params, n_splits)
         evaluations.append({**params, "avg_score": avg_score, "source": "refine"})
         return sign * avg_score
 
@@ -182,11 +198,11 @@ def _nelder_mead_refine(features, behaviors, task, best_params, grid_best_score,
     return best_params
 
 
-def _search(features, behaviors, output_folder, param_grid, task, n_splits, search, suffix=""):
+def _search(features, behaviors, output_folder, param_grid, task, n_splits, search, suffix="", n_jobs=1):
     """Run the coarse grid, optionally refine with Nelder-Mead, plot the tuning surface,
     and return the chosen best_params."""
     best_params, evaluations = _grid_search(
-        features, behaviors, output_folder, param_grid, task, n_splits, suffix=suffix)
+        features, behaviors, output_folder, param_grid, task, n_splits, suffix=suffix, n_jobs=n_jobs)
 
     if search == "nelder_mead":
         grid_scores = [e["avg_score"] for e in evaluations]
@@ -200,7 +216,6 @@ def _search(features, behaviors, output_folder, param_grid, task, n_splits, sear
     # placed on the tuning plot's log-gamma axis (and flagged as special) instead of dropped.
     for e in evaluations:
         e["gamma_numeric"] = _resolve_numeric_gamma(e["gamma"], features)
-        e["gamma_special"] = isinstance(e["gamma"], str)
 
     plot_tuning(evaluations, task, output_folder, suffix=suffix)
     return best_params
@@ -214,8 +229,16 @@ def _weight_map(est):
     return (est.dual_coef_ @ est.support_vectors_).ravel()
 
 
+def _single_permutation(features, behaviors, task, null_params):
+    """Run one permutation: shuffle labels, fit SVM, return weight map."""
+    perm_behaviors = shuffle(behaviors, random_state=None)
+    est = task.make_estimator(null_params)
+    est.fit(features, perm_behaviors)
+    return _weight_map(est)
+
+
 def _build_map(features, behaviors, masker, output_folder, task, best_params,
-               n_permutations, label="", suffix=""):
+               n_permutations, label="", suffix="", n_jobs=1):
     """Refit at best_params, build the support-vector (beta) map, permutation-test it
     into a z-map, and write all per-map artifacts. Returns a MapResult.
 
@@ -257,45 +280,33 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
 
     results_file = output_folder / f"null_distributions{suffix}.pkl"
 
-    sum_null = None
-    sum_null_squared = None
-    num_permutations = 0
+    import os
+    actual_jobs = os.cpu_count() if n_jobs == -1 else n_jobs
+    print(f"\nRunning {n_permutations} permutations with {actual_jobs} jobs...")
+    permute_time = time.time()
 
-    with open(results_file, 'wb') as f:
-        permute_time = time.time()
+    null_maps = Parallel(n_jobs=n_jobs, backend="threading")(
+        delayed(_single_permutation)(features, behaviors, task, null_params)
+        for _ in tqdm(range(n_permutations), desc="Queuing permutations")
+    )
 
-        time.sleep(1)
-        with tqdm(range(n_permutations), desc="Running permutations", unit="permutation", mininterval=1, ncols=100, dynamic_ncols=True, leave=True) as pbar:
-            for i in pbar:
-                perm_behaviors = shuffle(behaviors, random_state=None)
+    elapsed = time.time() - permute_time
+    print(f"Permutations completed in {easy_time(int(elapsed))}.")
 
-                est_permutation = task.make_estimator(null_params)
-
-                est_permutation.fit(features, perm_behaviors)
-
-                vector_mean = _weight_map(est_permutation)
-
-                pickle.dump(vector_mean, f)
-
-                if sum_null is None:
-                    sum_null = np.zeros_like(vector_mean)
-                    sum_null_squared = np.zeros_like(vector_mean)
-
-                sum_null += vector_mean
-                sum_null_squared += vector_mean ** 2
-                num_permutations += 1
-
-                del vector_mean
-
-                elapsed_time = time.time() - permute_time
-                pbar.set_postfix(refresh=False, elapsed=f"{easy_time(elapsed_time)}", eta=f"{easy_eta((elapsed_time / (i + 1)) * (n_permutations - i - 1))}")
-
-    print(f"Permutations completed. Null distribution saved to {results_file}\n")
-
-    mean_null = sum_null / num_permutations
-
-    variance = (sum_null_squared / num_permutations) - (mean_null ** 2)
+    # Compute null statistics
+    null_stack = np.array(null_maps)
+    mean_null = null_stack.mean(axis=0)
+    variance = null_stack.var(axis=0, ddof=0)
     std_null = np.sqrt(np.maximum(variance, 0) + 1e-8)
+    num_permutations = n_permutations
+
+    # Save null distributions to disk
+    with open(results_file, 'wb') as f:
+        for wmap in null_maps:
+            pickle.dump(wmap, f)
+    print(f"Null distribution saved to {results_file}\n")
+
+    del null_maps, null_stack
 
     # saving null map
     nifti_null_map = masking.unmask(mean_null, masker)
@@ -363,21 +374,21 @@ def _build_map(features, behaviors, masker, output_folder, task, best_params,
 
 def _fit_support_vector_map(features, behaviors, masker, output_folder, param_grid,
                             task, n_permutations, alpha, n_splits, search="grid",
-                            label="", suffix=""):
+                            label="", suffix="", n_jobs=1):
     """Single decision map (SVR / binary SVC): search hyper-params then build one z-map."""
     best_params = _search(features, behaviors, output_folder, param_grid, task, n_splits,
-                          search, suffix=suffix)
+                          search, suffix=suffix, n_jobs=n_jobs)
     return _build_map(features, behaviors, masker, output_folder, task, best_params,
-                      n_permutations, label=label, suffix=suffix)
+                      n_permutations, label=label, suffix=suffix, n_jobs=n_jobs)
 
 
 def _fit_ovr_maps(features, behaviors, masker, output_folder, param_grid,
-                  task, n_permutations, alpha, n_splits, search="grid"):
+                  task, n_permutations, alpha, n_splits, search="grid", n_jobs=1):
     """Option A multiclass one-vs-rest: a SINGLE grid search on the full multiclass
     problem (task.scorer, e.g. balanced accuracy) selects shared hyper-parameters, then
     one binary this-class-vs-rest map is built per class at those hyper-parameters -
     yielding K z-maps. Permutation testing (the expensive step) runs once per class."""
-    best_params = _search(features, behaviors, output_folder, param_grid, task, n_splits, search)
+    best_params = _search(features, behaviors, output_folder, param_grid, task, n_splits, search, n_jobs=n_jobs)
 
     classes = np.unique(behaviors)
     print(f"\nOne-vs-rest: building {len(classes)} class maps at shared params {best_params}")
@@ -390,13 +401,13 @@ def _fit_ovr_maps(features, behaviors, masker, output_folder, param_grid,
         y_bin = (behaviors == c).astype(int)
         results.append(
             _build_map(features, y_bin, masker, output_folder, task, best_params,
-                       n_permutations, label=c_name, suffix=suffix)
+                       n_permutations, label=c_name, suffix=suffix, n_jobs=n_jobs)
         )
     return results
 
 
 def svm_lsm(features, behaviors, masker, output_folder, param_grid, task,
-            n_permutations=1, alpha=0.05, n_splits=5, search="grid"):
+            n_permutations=1, alpha=0.05, n_splits=5, search="grid", n_jobs=1):
     """
     Generic SVM-based lesion-symptom mapping. Always returns a list of MapResult -
     length 1 for the single-map strategy (SVR and binary SVC), one per class for the
@@ -408,12 +419,12 @@ def svm_lsm(features, behaviors, masker, output_folder, param_grid, task,
     if task.map_strategy == "single":
         result = _fit_support_vector_map(
             features, behaviors, masker, output_folder, param_grid,
-            task, n_permutations, alpha, n_splits, search=search,
+            task, n_permutations, alpha, n_splits, search=search, n_jobs=n_jobs
         )
         return [result]
     if task.map_strategy == "ovr":
         return _fit_ovr_maps(
             features, behaviors, masker, output_folder, param_grid,
-            task, n_permutations, alpha, n_splits, search=search,
+            task, n_permutations, alpha, n_splits, search=search, n_jobs=n_jobs
         )
     raise NotImplementedError(f"map_strategy '{task.map_strategy}' not implemented yet")

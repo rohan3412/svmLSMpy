@@ -1,4 +1,4 @@
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression
 import numpy as np
 from tqdm import tqdm
 
@@ -19,28 +19,17 @@ def regress_covariates_from_lesions(features, covariates):
         print('NO covariates to regress from lesion data')
         return features
 
-    # Initialize output array
-    residualized_features = np.zeros_like(features)
-
-    # For each voxel, regress out the covariates
+    print("Regressing covariates out of lesion data (vectorized)...")
     n_voxels = features.shape[1]
-    lr = LinearRegression()
 
-    for voxel_idx in tqdm(range(n_voxels), desc="Regressing covariates out of lesion data..."):
-        voxel_values = features[:, voxel_idx]
+    # Add intercept column to covariates: shape (N, K+1)
+    X = np.column_stack([np.ones(covariates.shape[0]), covariates])
 
-        # Fit linear regression: voxel_values ~ covariates
-        lr.fit(covariates, voxel_values)
+    # Solve all voxels at once: beta = (X'X)^-1 X'Y where Y is (N, V)
+    beta, _, _, _ = np.linalg.lstsq(X, features, rcond=None)
 
-        # Calculate residuals: observed - predicted
-        residuals = voxel_values - lr.predict(covariates)
-
-        # Store residualized voxel values
-        residualized_features[:, voxel_idx] = residuals
+    # Residuals = observed - predicted
+    residualized_features = features - X @ beta
 
     print(f"Regressed covariates from {n_voxels} voxels")
-
     return residualized_features
-
-
-

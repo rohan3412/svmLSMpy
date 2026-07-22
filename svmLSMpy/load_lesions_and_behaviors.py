@@ -32,22 +32,44 @@ def load_lesions_and_behaviors(
 
     for filename in df['filename']:
         norm_filename = normalize_file_name(filename)
-        matches = [
-            file for file in os.listdir(lesion_folder)
-            if norm_filename in normalize_file_name(file)
+        folder_files = os.listdir(lesion_folder)
+
+        # Pass 1: Exact match (compare normalized stems)
+        exact_matches = [
+            file for file in folder_files
+            if normalize_file_name(os.path.splitext(file)[0]) == norm_filename
+               or normalize_file_name(file) == norm_filename
         ]
 
-        if not matches:
-            raise FileNotFoundError(
-                f"No lesion files found in '{lesion_folder}' containing '{filename}' "
-                f"(normalized as '{norm_filename}')"
-            )
-        if len(matches) > 1:
+        if len(exact_matches) == 1:
+            match = exact_matches[0]
+        elif len(exact_matches) > 1:
             raise ValueError(
-                f"CSV entry '{filename}' matches multiple lesion files in '{lesion_folder}':\n",matches
+                f"CSV entry '{filename}' exactly matches multiple lesion files: {exact_matches}"
             )
+        else:
+            # Pass 2: Substring fallback (bidirectional)
+            substring_matches = [
+                file for file in folder_files
+                if norm_filename in normalize_file_name(file)
+                   or normalize_file_name(file) in norm_filename
+            ]
 
-        lesion_file = os.path.join(lesion_folder, matches[0])
+            if len(substring_matches) == 1:
+                match = substring_matches[0]
+                print(f"  Note: '{filename}' matched via substring to '{match}'")
+            elif len(substring_matches) > 1:
+                raise ValueError(
+                    f"CSV entry '{filename}' has no exact match and matches multiple files "
+                    f"via substring: {substring_matches}"
+                )
+            else:
+                raise FileNotFoundError(
+                    f"No lesion files found in '{lesion_folder}' matching '{filename}' "
+                    f"(normalized as '{norm_filename}') by exact or substring match"
+                )
+
+        lesion_file = os.path.join(lesion_folder, match)
         if lesion_file in [pair[1] for pair in matched_pairs]:
             prev_entry = next(pair[0] for pair in matched_pairs if pair[1] == lesion_file)
             raise ValueError(

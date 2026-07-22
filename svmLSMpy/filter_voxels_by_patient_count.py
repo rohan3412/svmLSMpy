@@ -59,13 +59,17 @@ def filter_voxels_by_patient_count(lesion_files, min_patient_count, normalize_ve
     # Count the number of patients each voxel is involved in
     voxel_patient_count = np.sum(lesion_data_stack > 0, axis=0)
 
-    # Filter voxels
-    lesion_data_prepared = np.copy(lesion_data_stack)
-    lesion_data_prepared[:, voxel_patient_count < min_patient_count] = 0
+    # Filter voxels: drop those below minimum count, and those damaged in 100% of patients (0 variance)
+    valid_mask = (voxel_patient_count >= min_patient_count) & (voxel_patient_count < no_of_patients)
+
+    lesion_data_prepared = lesion_data_stack[:, valid_mask]
+    
+    # Update the masker so downstream unmasking expects the reduced feature size
+    new_masker = masking.unmask(valid_mask.astype(np.int8), masker)
 
     sum_of_vectors_filtered = np.sum(lesion_data_prepared, axis=0)
     sum_of_vectors_filtered = sum_of_vectors_filtered.astype(np.int32)  # Ensure integer type
-    sum_of_voxel_mni_filtered = masking.unmask(sum_of_vectors_filtered, masker)
+    sum_of_voxel_mni_filtered = masking.unmask(sum_of_vectors_filtered, new_masker)
     sum_of_vectors_filtered_path = output_folder / "lesion_overlap_filtered.nii.gz"
     nib.save(sum_of_voxel_mni_filtered, sum_of_vectors_filtered_path)
 
@@ -73,7 +77,9 @@ def filter_voxels_by_patient_count(lesion_files, min_patient_count, normalize_ve
         # Normalize the data to have unit norm
         lesion_data_prepared = normalize(lesion_data_prepared, norm='l2', axis=1)
 
-    return min_patient_count,lesion_data_prepared, masker
+    print(f"Features reduced from {lesion_data_stack.shape[1]} to {lesion_data_prepared.shape[1]} voxels.")
+
+    return min_patient_count, lesion_data_prepared, new_masker
 
 
 

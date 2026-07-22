@@ -79,7 +79,8 @@ def run_svm_lsm(symptom_folder,
                 alpha=0.05,
                 n_splits=5,
                 num_slices=7,
-                search="grid"):
+                search="grid",
+                n_jobs=-1):
     """
     Unified SVM-LSM entry point. Auto-detects SVR (continuous behaviour) vs SVC
     (categorical behaviour, binary or one-vs-rest multiclass) from the 'behavior'
@@ -112,7 +113,8 @@ def run_svm_lsm(symptom_folder,
                           alpha=alpha,
                           n_splits=n_splits,
                           num_slices=num_slices,
-                          search=search)
+                          search=search,
+                          n_jobs=n_jobs)
 
 
 def _run_with_task(symptom_folder,
@@ -131,7 +133,8 @@ def _run_with_task(symptom_folder,
                    alpha=0.05,
                    n_splits=5,
                    num_slices=7,
-                   search="grid"):
+                   search="grid",
+                   n_jobs=-1):
     """
     Shared SVM-LSM orchestrator for both SVR and SVC. Loads lesions + behaviour,
     filters voxels, regresses covariates, runs the generic svm_lsm core (which returns
@@ -204,7 +207,8 @@ def _run_with_task(symptom_folder,
                       n_permutations=n_permutations,
                       alpha=alpha,
                       n_splits=n_splits,
-                      search=search)
+                      search=search,
+                      n_jobs=n_jobs)
 
     # Dataset statistics
     num_lesions = len(lesion_files)
