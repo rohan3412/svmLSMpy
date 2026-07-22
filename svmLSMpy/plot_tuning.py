@@ -128,6 +128,9 @@ def _surface_html(u, v, score, grp, best_i, metric, title, ulab, vlab, path):
                                       line=dict(width=1, color="white"))))
     fig.add_trace(go.Scatter3d(x=[u[best_i]], y=[v[best_i]], z=[score[best_i] + lift],
                                mode="markers", name="best", marker=dict(size=9, color="red", symbol="x")))
-    fig.update_layout(title=title,
-                      scene=dict(xaxis_title=ulab, yaxis_title=vlab, zaxis_title=metric))
+    scene_kwargs = dict(xaxis_title=ulab, yaxis_title=vlab, zaxis_title=metric)
+    if metric in ["roc_auc_score", "balanced_accuracy_score", "accuracy_score"]:
+        scene_kwargs["zaxis"] = dict(title=metric, range=[-0.02, 1.02])
+    
+    fig.update_layout(title=title, scene=scene_kwargs)
     fig.write_html(str(path), include_plotlyjs=True)

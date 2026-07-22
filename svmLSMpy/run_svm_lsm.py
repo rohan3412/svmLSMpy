@@ -197,6 +197,20 @@ def _run_with_task(symptom_folder,
     else:
         print("\n\nNo covariates present\n\n")
 
+    if task.kind == "svc":
+        unique_classes, class_counts = np.unique(behaviors, return_counts=True)
+        min_class_count = int(np.min(class_counts))
+        if min_class_count < n_splits:
+            if min_class_count >= 2:
+                print(f"\n[WARNING] Minority class has only {min_class_count} samples.")
+                print(f"Dynamically reducing n_splits from {n_splits} to {min_class_count} "
+                      f"to ensure every fold receives at least one minority sample.\n")
+                n_splits = min_class_count
+            else:
+                print(f"\n[CRITICAL WARNING] Minority class has only {min_class_count} samples!")
+                print(f"Cross-validation is mathematically impossible for n_splits >= 2. "
+                      f"Scores will likely be undefined (NaN).\n")
+
     # Core: one MapResult per decision map (SVR / binary SVC -> 1; one-vs-rest -> K)
     results = svm_lsm(features=features,
                       behaviors=behaviors,

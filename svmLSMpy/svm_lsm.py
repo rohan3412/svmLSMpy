@@ -69,7 +69,12 @@ def _cv_score(features, behaviors, task, params, n_splits, verbose=False):
             print(f"\tscore : {score}", )
         scores.append(score)
 
-    return float(np.mean(scores)), scores, no_of_sv, float(np.mean(sv_fracs))
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        avg_score = float(np.nanmean(scores))
+        
+    return avg_score, scores, no_of_sv, float(np.mean(sv_fracs))
 
 
 def _eval_one_combo(combo, param_names, features, behaviors, task, n_splits):
